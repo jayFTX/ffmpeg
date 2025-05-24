@@ -1,0 +1,17 @@
+node_modules/
+build/
+
+*.log
+*.tmp
+*.mkv
+*.flv
+*.pcm
+*.mp4
+*.h264
+*.bpx
+*.vpx
+*.mp2
+*.rgb
+*.yuv
+*.aac
+*.mepg1

@@ -6,6 +6,7 @@
 #ifdef __cplusplus
 extern "C"{
 #endif
+#include <unistd.h>
 #include <pthread.h>
 #include <SDL3/SDL.h>
 #include <libavcodec/avcodec.h>
@@ -49,6 +50,39 @@ AVChannelLayout dst_ch_layout = AV_CHANNEL_LAYOUT_MONO;
 enum AVSampleFormat dst_sample_fmt = AV_SAMPLE_FMT_S16;
 int dst_nb_samples = 0, max_dst_nb_samples = 0;
 //
+
+#define AUDIO_BUFFER_SIZE 100
+#define VIDEO_BUFFER_SIZE 100
+//
+
+typedef struct AV_Context{
+    AVFormatContext *ifc;
+    int audio_index;
+    int video_index;
+
+    AVCodecContext *acodec;
+    AVCodecContext *vcodec;
+    const AVCodec *acode;
+    const AVCodec *vcode;
+
+    // std::vector<AVPacket *> a_buf;
+    // std::vector<AVPacket *> v_buf;
+    AVPacket *a_buf[AUDIO_BUFFER_SIZE];
+    AVPacket *v_buf[VIDEO_BUFFER_SIZE];
+    int a_buf_index;
+    int a_buf_in;
+    int v_buf_index;
+    int v_buf_in;
+
+
+    pthread_mutex_t audio_mutex;
+    pthread_mutex_t video_mutex;
+    pthread_cond_t audio_cond;
+    pthread_cond_t video_cond;
+
+    bool decode_flags = true;
+}AV_Context;
+
 #if 0
 static std::vector<uint8_t> s_vaudio;
 
@@ -69,6 +103,9 @@ static long int a_index = 0;
 static uint8_t *audio_pos = NULL;
 static long int audio_frames = 0;
 static long int video_frames = 0;
+
+int video_decode(AVCodecContext *vcodec, AVPacket *pkt, AVFrame *frame);
+int audio_decode(AVCodecContext *acodec, AVPacket *pkt, AVFrame *frame);
 
 void audio_stream_cb(void *userdata, SDL_AudioStream *stream, int additional_amount, int total_amount)
 {
@@ -111,22 +148,80 @@ void audio_stream_cb(void *userdata, SDL_AudioStream *stream, int additional_amo
 }
 #endif
 
-void *video_process_frame_t(void *args)
-{
-    pthread_mutex_lock(&mutex);
-    while(!buffer_ready){
-        pthread_cond_wait(&cond, &mutex);
-    }
-
-    /* consume */
-
-
-    pthread_mutex_unlock(&mutex);
-}
-
 void *audio_process_frame_t(void *args)
 {
+    av_log(NULL, AV_LOG_INFO, "audio_decode thread start!\n");
+    AV_Context *ctx = (AV_Context *)args;
+    int ret;
+    AVFrame *frame = av_frame_alloc();
+    if(!frame){
+        av_log(NULL, AV_LOG_ERROR, "av_frame_alloc error\n");
+        return NULL;
+    }
+    while(true){
+        pthread_mutex_lock(&ctx->audio_mutex);
+        while(ctx->a_buf_in == ctx->a_buf_index){
+            if(ctx->a_buf_index == AUDIO_BUFFER_SIZE){
+                ctx->a_buf_index = 0;
+                ctx->a_buf_in = 0;
+            }
+            if(ctx->decode_flags == false)
+                goto __finished;
+            pthread_cond_wait(&ctx->audio_cond, &ctx->audio_mutex);
+        }
+        /* consume */
+        ret = audio_decode(ctx->acodec, ctx->a_buf[ctx->a_buf_in++], frame);
+        if(ret < 0){
+            av_log(NULL, AV_LOG_ERROR, "audio_decode error\n");
+        }
+        av_packet_unref(ctx->a_buf[ctx->a_buf_in-1]);
 
+        pthread_mutex_unlock(&ctx->audio_mutex);
+    }
+__finished:
+
+    av_frame_free(&frame);
+    av_log(NULL, AV_LOG_INFO, "audio_decode thread exit!\n");
+    return NULL;
+}
+
+void *video_process_frame_t(void *args)
+{
+    av_log(NULL, AV_LOG_INFO, "video_decode thread start!\n");
+    AV_Context *ctx = (AV_Context *)args;
+    int ret;
+    AVFrame *frame = av_frame_alloc();
+    if(!frame){
+        av_log(NULL, AV_LOG_ERROR, "av_frame_alloc error\n");
+        return NULL;
+    }
+    while(true){
+        pthread_mutex_lock(&ctx->video_mutex);
+        while(ctx->v_buf_in == ctx->v_buf_index){
+            if(ctx->v_buf_index == VIDEO_BUFFER_SIZE){
+                ctx->v_buf_index = 0;
+                ctx->v_buf_in = 0;
+            }
+            if(ctx->decode_flags == false)
+                goto __finished;
+            
+            pthread_cond_wait(&ctx->video_cond, &ctx->video_mutex);
+        }
+        /* consume */
+        ret = video_decode(ctx->vcodec, ctx->v_buf[ctx->v_buf_in++], frame);
+        if(ret < 0){
+            av_log(NULL, AV_LOG_ERROR, "video_decode error\n");
+        }
+        
+        av_packet_unref(ctx->v_buf[ctx->v_buf_in-1]);
+
+        pthread_mutex_unlock(&ctx->video_mutex);
+    }
+
+__finished:
+    av_frame_free(&frame);
+    av_log(NULL, AV_LOG_INFO, "video_decode thread exit!\n");
+    return NULL;
 }
 
 void init()
@@ -195,9 +290,11 @@ void process_decoded_data(AVFrame *frame, int bytes_per_sample)
 {
 #ifdef __cplusplus
     int frame_size_perchannel = frame->nb_samples * bytes_per_sample;
-    av_log(NULL, AV_LOG_INFO, "frame_size_perchannel = %d \n", frame_size_perchannel);
+    av_log(NULL, AV_LOG_INFO, "[audio: %ld]: frame_size_perchannel = %d \n", audio_frames+1, frame_size_perchannel);
     int buffer_size = frame->nb_samples * frame->ch_layout.nb_channels * bytes_per_sample;
-
+    if(!frame->data[0]){
+        av_log(NULL, AV_LOG_INFO, "[audio: %ld]: frame.data error \n");
+    }
     for(int i = 0; i < frame->nb_samples; i++){
         for(int j = 0; j < frame->ch_layout.nb_channels; j++){
             const char *p = reinterpret_cast<const char *>(frame->data[j] + i * bytes_per_sample);
@@ -282,13 +379,13 @@ int audio_decode(AVCodecContext *acodec, AVPacket *pkt, AVFrame *frame)
     int ret;
     ret = avcodec_send_packet(acodec, pkt);
     if(ret == AVERROR(EAGAIN)){
-        av_log(NULL, AV_LOG_WARNING, "codec buffer is fulled \n");
+        av_log(NULL, AV_LOG_WARNING, "acodec buffer is fulled \n");
         return -1;
     }else if(ret == AVERROR(EINVAL)){
-        av_log(NULL, AV_LOG_WARNING, "codec is not opened \n");
+        av_log(NULL, AV_LOG_WARNING, "acodec is not opened \n");
         return -1;
     }else if(ret == AVERROR_EOF){
-        av_log(NULL, AV_LOG_WARNING, "codec buffer is flushed \n");
+        av_log(NULL, AV_LOG_WARNING, "acodec buffer is flushed \n");
         return -1;
     }else if(ret < 0)
     {
@@ -298,7 +395,7 @@ int audio_decode(AVCodecContext *acodec, AVPacket *pkt, AVFrame *frame)
     }
 
     while(avcodec_receive_frame(acodec, frame) >= 0){
-        av_log(NULL, AV_LOG_INFO, "[%ld]:decode audio_data info: \n \
+        av_log(NULL, AV_LOG_INFO, "[audio: %ld]:decode audio_data info: \n \
             [frame->sample_rate]=  %d, \n \
             [frame->nb_samples]=  %d, \n \
             [frame->channels]=  %d, \n \
@@ -311,17 +408,17 @@ int audio_decode(AVCodecContext *acodec, AVPacket *pkt, AVFrame *frame)
 
         if (av_sample_fmt_is_planar((AVSampleFormat)(frame)->format)) {
             // 使用 data[0], data[1], ...
-            av_log(NULL, AV_LOG_INFO, "[%ld]: audio channel is planar \n", audio_frames+1);
+            av_log(NULL, AV_LOG_INFO, "[audio: %ld]: audio channel is planar \n", audio_frames+1);
         } else {
             // 使用 data[0] 作为 interleaved
-            av_log(NULL, AV_LOG_INFO, "[%ld]: audio channel is not planar \n", audio_frames+1);
+            av_log(NULL, AV_LOG_INFO, "[audio: %ld]: audio channel is not planar \n", audio_frames+1);
         }
         int bytes_per_sample = av_get_bytes_per_sample((AVSampleFormat)acodec->sample_fmt);
-        av_log(NULL, AV_LOG_INFO, "bytes_per_sample = %d \n", bytes_per_sample);
+        av_log(NULL, AV_LOG_INFO, "[audio: %ld]: bytes_per_sample = %d \n", audio_frames+1, bytes_per_sample);
         // pthread_mutex_lock(&mutex);
         #if 1
         process_decoded_data(frame, bytes_per_sample);
-        av_log(NULL, AV_LOG_INFO, "[%ld] frame is processed!\n", audio_frames+1);
+        av_log(NULL, AV_LOG_INFO, "[audio: %ld] this audio_frame is processed!\n\n", audio_frames+1);
         buffer_ready = true; 
         // pthread_cond_signal(&cond);  // 通知音频线程可以播放了
         // pthread_mutex_unlock(&mutex);
@@ -340,13 +437,13 @@ int video_decode(AVCodecContext *vcodec, AVPacket *pkt, AVFrame *frame)
     int ret;
     ret = avcodec_send_packet(vcodec, pkt);
     if(ret == AVERROR(EAGAIN)){
-        av_log(NULL, AV_LOG_WARNING, "codec buffer is fulled \n");
+        av_log(NULL, AV_LOG_WARNING, "vcodec buffer is fulled \n");
         return 0;
     }else if(ret == AVERROR(EINVAL)){
-        av_log(NULL, AV_LOG_WARNING, "codec is not opened \n");
+        av_log(NULL, AV_LOG_WARNING, "vcodec is not opened \n");
         return -1;
     }else if(ret == AVERROR_EOF){
-        av_log(NULL, AV_LOG_WARNING, "codec buffer is flushed \n");
+        av_log(NULL, AV_LOG_WARNING, "vcodec buffer is flushed \n");
         return -1;
     }else if(ret < 0)
     {
@@ -356,7 +453,7 @@ int video_decode(AVCodecContext *vcodec, AVPacket *pkt, AVFrame *frame)
     }
 
     while(avcodec_receive_frame(vcodec, frame) >= 0){
-        av_log(NULL, AV_LOG_INFO, "[%ld]:decode video_data info: \n \
+        av_log(NULL, AV_LOG_INFO, "[video %ld]:decode video_data info: \n \
             [frame->width]=  %d, \n \
             [frame->height]=  %d, \n \
             [frame->pixel_format]=  %s, \n \
@@ -389,10 +486,16 @@ int video_decode(AVCodecContext *vcodec, AVPacket *pkt, AVFrame *frame)
 
         // SDL_FRect dst = {0, 0, 800, 600 };
         if(!SDL_RenderTexture(renderer, texture, NULL, NULL)){
+            SDL_Log("SDL_RenderTexture Error\n");
             return -1;
         } // SDL3 的 API
-        SDL_RenderPresent(renderer);
-        // SDL_Delay(40);
+        if(!SDL_RenderPresent(renderer)){
+            SDL_Log("SDL_RenderTexture Error\n");
+            return -1;
+        }
+        // SDL_Delay(4);
+        usleep(10000);
+        av_log(NULL, AV_LOG_INFO, "[video %ld]: this video_frame is processed!\n\n", video_frames+1);
         video_frames++;
         av_frame_unref(frame);
     }
@@ -402,19 +505,37 @@ int video_decode(AVCodecContext *vcodec, AVPacket *pkt, AVFrame *frame)
 int main(int argc, char *argv[])
 {
     // enviroment prepare
-    int ret, audio_index = -1, video_index = -1;
-    AVFormatContext *ifc = NULL;
-    AVCodecContext *acodec = NULL;
-    const AVCodec *acode = NULL;
+    AV_Context ctx = {0};
+    int ret;
+    ctx.audio_index = -1, ctx.video_index = -1;
 
-    AVCodecContext *vcodec = NULL;
-    const AVCodec *vcode = NULL;
+    for(int i = 0; i < AUDIO_BUFFER_SIZE; i++){
+        ctx.a_buf[i] = av_packet_alloc();
+        if(!ctx.a_buf[i]){
+            av_log(NULL, AV_LOG_WARNING, "av_packet_alloc error! \n");
+        }
+    }
 
-    // AVStream *stream = NULL;
+    for(int i = 0; i < VIDEO_BUFFER_SIZE; i++){
+        ctx.v_buf[i] = av_packet_alloc();
+        if(!ctx.v_buf[i]){
+            av_log(NULL, AV_LOG_WARNING, "av_packet_alloc error! \n");
+        }
+    }
+
     AVPacket *pkt = NULL;
     AVFrame *frame = NULL;
 
-    //
+    // AVFormatContext *ifc = NULL;
+    // AVCodecContext *acodec = NULL;
+    // const AVCodec *acode = NULL;
+
+    // AVCodecContext *vcodec = NULL;
+    // const AVCodec *vcode = NULL;
+
+    // // AVStream *stream = NULL;
+    // AVPacket *pkt = NULL;
+    // AVFrame *frame = NULL;
 
     //
     if(argc < 3){
@@ -423,8 +544,12 @@ int main(int argc, char *argv[])
     }
     const char *filename = argv[1], *of_name = argv[2];
 
-    pthread_mutex_init(&mutex, NULL);
-    pthread_cond_init(&cond, NULL);
+    pthread_mutex_init(&ctx.audio_mutex, NULL);
+    pthread_mutex_init(&ctx.video_mutex, NULL);
+
+    pthread_cond_init(&ctx.audio_cond, NULL);
+    pthread_cond_init(&ctx.video_cond, NULL);
+
 
     // initiate SDL and av and prepare
     if(!SDL_Init(SDL_INIT_AUDIO | SDL_INIT_VIDEO)){
@@ -432,16 +557,19 @@ int main(int argc, char *argv[])
         return -1;
     };
 
-    if(!pthread_create(&vpid, NULL, video_process_frame_t, NULL)){
+    if(pthread_create(&vpid, NULL, video_process_frame_t, &ctx) < 0){
         av_log(NULL, AV_LOG_ERROR, "pthread_create error!\n");
         return -1;
     }
 
-    if(!pthread_create(&apid, NULL, audio_process_frame_t, NULL)){
+    if(pthread_create(&apid, NULL, audio_process_frame_t, &ctx) < 0){
         av_log(NULL, AV_LOG_ERROR, "pthread_create error!\n");
         return -1;
     }
 
+    pthread_detach(vpid);
+    pthread_detach(apid);
+    //
     #ifdef __cplusplus
     of.open(of_name, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
     #else
@@ -451,19 +579,19 @@ int main(int argc, char *argv[])
     }
     #endif
     // 
-    ret = open_containerFormat_get_av_index(&ifc, filename, &audio_index, &video_index);
+    ret = open_containerFormat_get_av_index(&ctx.ifc, filename, &ctx.audio_index, &ctx.video_index);
     if(ret < 0){
         av_log(NULL, AV_LOG_ERROR, "open_containerFormat_get_audiostream_index error! \n");
         goto __failed;
     }
     //
-    ret = open_avcode_context(ifc, &acode, &acodec, audio_index);
+    ret = open_avcode_context(ctx.ifc, &ctx.acode, &ctx.acodec, ctx.audio_index);
     if(ret < 0){
         av_log(NULL, AV_LOG_ERROR, "open_acode_context audio_stream acodec error! \n");
         goto __failed;
     }
 
-    ret = open_avcode_context(ifc, &vcode, &vcodec, video_index);
+    ret = open_avcode_context(ctx.ifc, &ctx.vcode, &ctx.vcodec, ctx.video_index);
     if(ret < 0){
         av_log(NULL, AV_LOG_ERROR, "open_acode_context video_stream acodec error! \n");
         goto __failed;
@@ -479,12 +607,12 @@ int main(int argc, char *argv[])
 
     /* set options */
     
-    av_opt_set_chlayout(swr_ctx, "in_chlayout",    &acodec->ch_layout, 0);
-    av_opt_set_int(swr_ctx, "in_sample_rate",       acodec->sample_rate, 0);
-    av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt", acodec->sample_fmt, 0);
+    av_opt_set_chlayout(swr_ctx, "in_chlayout",    &ctx.acodec->ch_layout, 0);
+    av_opt_set_int(swr_ctx, "in_sample_rate",       ctx.acodec->sample_rate, 0);
+    av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt", ctx.acodec->sample_fmt, 0);
 
     av_opt_set_chlayout(swr_ctx, "out_chlayout",    &dst_ch_layout, 0);
-    av_opt_set_int(swr_ctx, "out_sample_rate",       acodec->sample_rate, 0);
+    av_opt_set_int(swr_ctx, "out_sample_rate",       ctx.acodec->sample_rate, 0);
     av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", dst_sample_fmt, 0);
 
     /* initialize the resampling context */
@@ -499,8 +627,8 @@ int main(int argc, char *argv[])
     audio_pos = audio_buf;
     
     #if 1
-    audio_spec.channels = acodec->ch_layout.nb_channels;
-    audio_spec.freq = acodec->sample_rate;
+    audio_spec.channels = ctx.acodec->ch_layout.nb_channels;
+    audio_spec.freq = ctx.acodec->sample_rate;
     audio_spec.format = SDL_AUDIO_F32LE;
     #else
     audio_spec.channels = dst_ch_layout.nb_channels;
@@ -517,52 +645,86 @@ int main(int argc, char *argv[])
     SDL_ResumeAudioStreamDevice(audio_stream);
 
     // open windows
-    if(!SDL_CreateWindowAndRenderer("audio_play", WINDOW_WIDTH, WINDOW_HEIGHT, 0, &window, &renderer)){
+    if(!SDL_CreateWindowAndRenderer("av_play", WINDOW_WIDTH, WINDOW_HEIGHT, 0, &window, &renderer)){
         SDL_Log("SDL_CreateWindowAndRenderer error  %s", SDL_GetError());
         goto __failed;
     }
 
-    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, vcodec->width, vcodec->height);
+    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, ctx.vcodec->width, ctx.vcodec->height);
     if(!texture){
         SDL_Log("SDL_CreateTexture error  %s", SDL_GetError());
         goto __failed;
     }
+
     // decode
     pkt = av_packet_alloc();
     if(!pkt){
         av_log(NULL, AV_LOG_WARNING, "av_packet_alloc error! \n");
     }
+
     frame = av_frame_alloc();
     if(!frame){
         av_log(NULL, AV_LOG_WARNING, "av_frame_alloc error! \n");
     }
 
-    while(av_read_frame(ifc, pkt) >= 0){
-        if(pkt->stream_index == audio_index){
-            pthread_mutex_lock(&mutex);
-            
-            ret = audio_decode(acodec, pkt, frame);
-            if(ret < 0){
-                av_log(NULL, AV_LOG_ERROR, "audio_decode failed!\n");
-                break;
-            }
-            /* produce */
-            pthread_cond_signal(&cond);
-            pthread_mutex_unlock(&mutex);
+    // ctx.audio_frame = av_frame_alloc();
+    // audio_frame = ctx.audio_frame;
+    // if(!audio_frame){
+    //     av_log(NULL, AV_LOG_WARNING, "av_frame_alloc error! \n");
+    // }
 
-        }else if(pkt->stream_index == video_index){
-            ret = video_decode(vcodec, pkt, frame);
-            if(ret < 0){
-                av_log(NULL, AV_LOG_ERROR, "video_decode failed!\n");
-                break;
+    // ctx.video_frame = av_frame_alloc();
+    // video_frame = ctx.video_frame;
+    // if(!video_frame){
+    //     av_log(NULL, AV_LOG_WARNING, "av_frame_alloc error! \n");
+    // }
+
+    while(av_read_frame(ctx.ifc, pkt) >= 0){
+        if(pkt->stream_index == ctx.audio_index){
+            pthread_mutex_lock(&ctx.audio_mutex);
+            if(ctx.a_buf_index >= AUDIO_BUFFER_SIZE){
+                pthread_mutex_unlock(&ctx.audio_mutex);
+                while(ctx.a_buf_index != 0);
             }
+            av_packet_ref(ctx.a_buf[ctx.a_buf_index++], pkt);
+            // ctx.a_buf[ctx.a_buf_index++] = ctx.audio_pkt;
+
+            // ret = audio_decode(ctx.acodec, pkt, frame);
+            // if(ret < 0){
+            //     av_log(NULL, AV_LOG_ERROR, "audio_decode failed!\n");
+            //     break;
+            // }
+            /* produce */
+            pthread_cond_signal(&ctx.audio_cond);
+            pthread_mutex_unlock(&ctx.audio_mutex);
+
+        }else if(pkt->stream_index == ctx.video_index){
+            pthread_mutex_lock(&ctx.video_mutex);
+            if(ctx.v_buf_index >= VIDEO_BUFFER_SIZE){
+                pthread_mutex_unlock(&ctx.video_mutex);
+                while(ctx.v_buf_index != 0);
+            }
+
+            /* produce */
+            av_packet_ref(ctx.v_buf[ctx.v_buf_index++], pkt);
+
+            // ctx.v_buf[ctx.v_buf_index] = ctx.video_pkt;
+
+            pthread_cond_signal(&ctx.video_cond);
+            pthread_mutex_unlock(&ctx.video_mutex);
+            // ret = video_decode(ctx.vcodec, pkt, frame);
+            // if(ret < 0){
+            //     av_log(NULL, AV_LOG_ERROR, "video_decode failed!\n");
+            //     break;
+            // }
         }
         av_packet_unref(pkt);
     }
+    av_log(NULL, AV_LOG_INFO, "decode pharse is over!\n");
     // 5. Flush decoder
-    audio_decode(acodec, NULL, frame);
-    video_decode(vcodec, NULL, frame);
-
+    // audio_decode(ctx.acodec, NULL, frame);
+    // video_decode(ctx.vcodec, NULL, frame);
+    ctx.decode_flags = false;
     
     SDL_Event event;
     while(running){
@@ -589,11 +751,17 @@ __failed:
     fclose(of);
     #endif
     free(audio_buf);
-    avformat_free_context(ifc);
+    avformat_free_context(ctx.ifc);
     av_packet_free(&pkt);
     av_frame_free(&frame);
-    avcodec_free_context(&acodec);
-    avcodec_free_context(&vcodec);
+    for(int i = 0; i < AUDIO_BUFFER_SIZE; i++){
+        av_packet_free(&ctx.a_buf[i]);
+    }
+    for(int i = 0; i < VIDEO_BUFFER_SIZE; i++){
+        av_packet_free(&ctx.v_buf[i]);
+    }
+    avcodec_free_context(&ctx.acodec);
+    avcodec_free_context(&ctx.vcodec);
 
     
     SDL_DestroyWindow(window);

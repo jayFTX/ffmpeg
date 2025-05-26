@@ -15,3 +15,5 @@ build/
 *.yuv
 *.aac
 *.mepg1
+*.avi
+*.mov

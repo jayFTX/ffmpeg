@@ -25,8 +25,6 @@ extern "C"{
 #define WINDOW_WIDTH 432
 #define WINDOW_HEIGHT 768
 #define MAX_AUDIO_QUEUE_SIZE 10000
-// 控制音频播放设备 对音频流的format
-#define AUDIOSPEC_FORMAT SDL_AUDIO_F32LE
 
 static char error_str[AV_ERROR_MAX_STRING_SIZE];
 static std::fstream of;
@@ -34,6 +32,8 @@ static pthread_t vpid;
 static pthread_t apid;
 static pthread_t rpid;
 static pthread_t ap_pid;
+static pthread_t e_pid;
+
 
 //
 static SDL_AudioStream *audio_stream = NULL;
@@ -43,7 +43,7 @@ static SDL_Renderer *renderer = NULL;
 
 static SDL_AudioSpec audio_spec;
 static bool running = true;
-
+static bool ap_running = true;
 //
 SwrContext *swr_ctx = NULL;
 int dst_rate = 44100;
@@ -186,7 +186,7 @@ void *audio_process_frame_t(void *args)
         av_log(NULL, AV_LOG_ERROR, "av_frame_alloc error\n");
         return NULL;
     }
-    while(true){
+    while(ctx->audio_pkt_decode_flags){
         pthread_mutex_lock(&ctx->pkt_queue.audio_mutex);
         while(ctx->pkt_queue.a_buf_front == ctx->pkt_queue.a_buf_rear){
 
@@ -195,6 +195,11 @@ void *audio_process_frame_t(void *args)
                 goto __finished;
             }
             pthread_cond_wait(&ctx->pkt_queue.audio_cond, &ctx->pkt_queue.audio_mutex);
+        }
+        if(ctx->audio_pkt_decode_flags == false){
+            pthread_cond_signal(&ctx->pkt_queue.audio_cond);
+            pthread_mutex_unlock(&ctx->pkt_queue.audio_mutex);
+            break;
         }
         /* consume */
         ai_index = ctx->pkt_queue.a_buf_front;
@@ -207,7 +212,7 @@ void *audio_process_frame_t(void *args)
             return NULL;
         }
 
-        while(true){
+        while(ctx->audio_pkt_decode_flags){
             ret = avcodec_receive_frame(ctx->acodec, frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                 break;
@@ -245,9 +250,17 @@ void *audio_process_frame_t(void *args)
             // produce
             pthread_mutex_lock(&ctx->frame_queue.audio_mutex);
             while((ctx->frame_queue.a_buf_rear + 1) % AUDIO_BUFFER_SIZE == ctx->frame_queue.a_buf_front){
-                // pthread_mutex_unlock(&ctx->q.video_mutex);
-                // while(ctx->q.v_buf_index != 0);
+                if(ap_running == false){
+                    pthread_cond_signal(&ctx->frame_queue.audio_cond);
+                    pthread_mutex_unlock(&ctx->frame_queue.audio_mutex);
+                    break;
+                }
                 pthread_cond_wait(&ctx->frame_queue.audio_cond, &ctx->frame_queue.audio_mutex);
+            }
+            if(ap_running == false){
+                pthread_cond_signal(&ctx->frame_queue.audio_cond);
+                pthread_mutex_unlock(&ctx->frame_queue.audio_mutex);
+                break;
             }
             aw_index = ctx->frame_queue.a_buf_rear;
             ctx->frame_queue.a_buf_rear = (ctx->frame_queue.a_buf_rear + 1) % AUDIO_BUFFER_SIZE;
@@ -268,6 +281,10 @@ void *audio_process_frame_t(void *args)
     }
 __finished:
     ctx->audio_pkt_decode_flags = false;
+    // 线程退出时一定要通知对方，不然对方wait(cond)一直阻塞，然后pthread_join(对方线程)就会死锁。
+    pthread_cond_signal(&ctx->pkt_queue.audio_cond);
+    pthread_cond_signal(&ctx->frame_queue.audio_cond);
+
     av_frame_free(&frame);
     av_log(NULL, AV_LOG_INFO, "audio_pkt_decode thread exit!\n");
 
@@ -284,14 +301,19 @@ void *video_process_frame_t(void *args)
         av_log(NULL, AV_LOG_ERROR, "av_frame_alloc error\n");
         return NULL;
     }
-    while(true){
+    while(ctx->video_pkt_decode_flags){
         pthread_mutex_lock(&ctx->pkt_queue.video_mutex);
         while(ctx->pkt_queue.v_buf_front == ctx->pkt_queue.v_buf_rear){
-            if(ctx->read_pkt_flags == false){
+            if(ctx->read_pkt_flags == false){ 
                 pthread_mutex_unlock(&ctx->pkt_queue.video_mutex);
                 goto __finished;
             }
             pthread_cond_wait(&ctx->pkt_queue.video_cond, &ctx->pkt_queue.video_mutex);
+        }
+        if(ctx->video_pkt_decode_flags == false){
+            pthread_cond_signal(&ctx->pkt_queue.video_cond);
+            pthread_mutex_unlock(&ctx->pkt_queue.video_mutex);
+            break;
         }
         /* consume */
         // ret = video_decode(ctx->vcodec, ctx->v_buf[ctx->v_buf_in++], frame);
@@ -309,7 +331,7 @@ void *video_process_frame_t(void *args)
             av_log(NULL, AV_LOG_ERROR, "avcodec_send_packet error %s\n", error_str);
             return NULL;
         }
-        while(true){
+        while(ctx->video_pkt_decode_flags){
             ret = avcodec_receive_frame(ctx->vcodec, frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                 break;
@@ -335,9 +357,17 @@ void *video_process_frame_t(void *args)
             // produce
             pthread_mutex_lock(&ctx->frame_queue.video_mutex);
             while((ctx->frame_queue.v_buf_rear+1) % VIDEO_BUFFER_SIZE == ctx->frame_queue.v_buf_front){
-                // pthread_mutex_unlock(&ctx->q.video_mutex);
-                // while(ctx->q.v_buf_index != 0);
+                if(running == false){ // 对于生产者来说， 消费者已阻塞， 生产者也要结束， 不然死锁。
+                    pthread_cond_signal(&ctx->frame_queue.video_cond);
+                    pthread_mutex_unlock(&ctx->frame_queue.video_mutex);
+                    break;
+                }
                 pthread_cond_wait(&ctx->frame_queue.video_cond, &ctx->frame_queue.video_mutex);
+            }
+            if(running == false){
+                pthread_cond_signal(&ctx->frame_queue.video_cond);
+                pthread_mutex_unlock(&ctx->frame_queue.video_mutex);
+                break;
             }
             vwq_index = ctx->frame_queue.v_buf_rear;
             ctx->frame_queue.v_buf_rear = (ctx->frame_queue.v_buf_rear + 1) % VIDEO_BUFFER_SIZE;
@@ -360,6 +390,10 @@ void *video_process_frame_t(void *args)
 
 __finished:
     ctx->video_pkt_decode_flags = false;
+    // 线程退出时一定要通知对方，不然对方wait(cond)一直阻塞，然后pthread_join(对方线程)就会死锁。
+    pthread_cond_signal(&ctx->pkt_queue.video_cond);
+    pthread_cond_signal(&ctx->frame_queue.video_cond);
+
     av_frame_free(&frame);
     av_log(NULL, AV_LOG_INFO, "video_pkt_decode thread exit!\n");
 
@@ -381,7 +415,17 @@ void *read_pkt(void *args)
         if(pkt->stream_index == ctx->audio_index){
             pthread_mutex_lock(&ctx->pkt_queue.audio_mutex);
             while((ctx->pkt_queue.a_buf_rear + 1) % AUDIO_BUFFER_SIZE == ctx->pkt_queue.a_buf_front){
+                if(ctx->read_pkt_flags == false){ // 通知退出时
+                    pthread_cond_signal(&ctx->pkt_queue.audio_cond);
+                    pthread_mutex_unlock(&ctx->pkt_queue.audio_mutex);
+                    break;
+                }
                 pthread_cond_wait(&ctx->pkt_queue.audio_cond, &ctx->pkt_queue.audio_mutex);
+            }
+            if(ctx->read_pkt_flags == false){ // 通知退出时
+                pthread_cond_signal(&ctx->pkt_queue.audio_cond);
+                pthread_mutex_unlock(&ctx->pkt_queue.audio_mutex);
+                break;
             }
             aw_index = ctx->pkt_queue.a_buf_rear;
             ctx->pkt_queue.a_buf_rear = (ctx->pkt_queue.a_buf_rear + 1) % AUDIO_BUFFER_SIZE;
@@ -397,11 +441,18 @@ void *read_pkt(void *args)
         }else if(pkt->stream_index == ctx->video_index){
             pthread_mutex_lock(&ctx->pkt_queue.video_mutex);
             while((ctx->pkt_queue.v_buf_rear + 1) % VIDEO_BUFFER_SIZE == ctx->pkt_queue.v_buf_front){
-                // pthread_mutex_unlock(&ctx->video_mutex);
-                // while(ctx->v_buf_index != 0);
+                if(ctx->read_pkt_flags == false){ // 通知退出时
+                    pthread_cond_signal(&ctx->pkt_queue.video_cond);
+                    pthread_mutex_unlock(&ctx->pkt_queue.video_mutex);
+                    break;
+                }
                 pthread_cond_wait(&ctx->pkt_queue.video_cond, &ctx->pkt_queue.video_mutex);
             }
-
+            if(ctx->read_pkt_flags == false){ // 通知退出时
+                pthread_cond_signal(&ctx->pkt_queue.video_cond);
+                pthread_mutex_unlock(&ctx->pkt_queue.video_mutex);
+                break;
+            }
             /* produce */
             vw_index = ctx->pkt_queue.v_buf_rear;
             ctx->pkt_queue.v_buf_rear = (ctx->pkt_queue.v_buf_rear + 1) % VIDEO_BUFFER_SIZE;
@@ -421,7 +472,7 @@ void *read_pkt(void *args)
 
     if(ret == AVERROR_EOF){
         av_log(NULL, AV_LOG_INFO, "av_read_frame: End of file.\n");
-    }else{
+    }else if(ret < 0){
         av_strerror(ret, error_str, sizeof(error_str));
         av_log(NULL, AV_LOG_ERROR, "av_read_frame error: %s\n", error_str);
     }
@@ -430,6 +481,9 @@ void *read_pkt(void *args)
     av_log(NULL, AV_LOG_INFO, "audio_pkts = %ld, video_pkts = %ld\n", audio_pkts, video_pkts);
 
     ctx->read_pkt_flags = false;
+    // 线程退出时一定要通知对方，不然对方wait(cond)一直阻塞，然后pthread_join(对方线程)就会死锁。
+    pthread_cond_signal(&ctx->pkt_queue.audio_cond);
+    pthread_cond_signal(&ctx->pkt_queue.video_cond);
 
     av_packet_free(&pkt);
     return NULL;
@@ -441,8 +495,7 @@ void *audio_play(void *args)
     AV_Context *ctx = (AV_Context *)args;
     int ret, ai_index;
     AVFrame *frame = NULL;
-    bool running = true;
-    while(running){
+    while(ap_running){
         pthread_mutex_lock(&ctx->frame_queue.audio_mutex);
 
         while(ctx->frame_queue.a_buf_front == ctx->frame_queue.a_buf_rear){
@@ -451,6 +504,11 @@ void *audio_play(void *args)
                 goto __finished;
             }
             pthread_cond_wait(&ctx->frame_queue.audio_cond, &ctx->frame_queue.audio_mutex);
+        }
+        if(ap_running == false){
+            pthread_cond_signal(&ctx->frame_queue.audio_cond);
+            pthread_mutex_unlock(&ctx->frame_queue.audio_mutex);
+            break;
         }
 
         ai_index = ctx->frame_queue.a_buf_front;
@@ -494,9 +552,38 @@ void *audio_play(void *args)
     }
 __finished:
     // av_frame_free(&frame);
+    // pthread_cond_signal(&ctx->frame_queue.audio_cond);
+
     av_log(NULL, AV_LOG_INFO, "audio_play thread exit!\n");
     return NULL;
 }
+
+// void *event_process_t(void *args)
+// {
+//     av_log(NULL, AV_LOG_INFO, "event_process_t thread  start!\n");
+//     AV_Context *ctx = (AV_Context *)args;
+//     SDL_Event event;
+//     while(running){
+//         while(SDL_PollEvent(&event)){
+//             switch(event.type){
+//                 case SDL_EVENT_QUIT:
+//                     running = false;
+//                     break;
+//                 case SDL_EVENT_KEY_DOWN:
+//                     if(event.key.key == SDLK_ESCAPE){
+//                         running = false;
+//                     }
+//                     break;
+//                 default:
+//                     break;
+//             }
+//         }
+
+//         // SDL_Log("event.type = %d", event.type);
+//     }
+//     av_log(NULL, AV_LOG_INFO, "event_process_t thread  exit!\n");
+//     return NULL;
+// }
 
 int init(AV_Context *ctx, const char *of_name)
 {
@@ -611,7 +698,22 @@ int sdl_prepare_init(AV_Context *ctx)
     #if 1
     audio_spec.channels = ctx->acodec->ch_layout.nb_channels;
     audio_spec.freq = ctx->acodec->sample_rate;
-    audio_spec.format = AUDIOSPEC_FORMAT;
+    if(ctx->acodec->sample_fmt == AV_SAMPLE_FMT_FLTP){
+        audio_spec.format = SDL_AUDIO_F32LE;
+        av_log(NULL, AV_LOG_INFO, "SDL_AUDIO_F32LE");
+    }else if(ctx->acodec->sample_fmt == AV_SAMPLE_FMT_S16){
+        audio_spec.format = SDL_AUDIO_S16LE;
+        av_log(NULL, AV_LOG_INFO, "SDL_AUDIO_S16LE");
+    }else if(ctx->acodec->sample_fmt == AV_SAMPLE_FMT_S32){
+        audio_spec.format = SDL_AUDIO_S32LE;
+        av_log(NULL, AV_LOG_INFO, "SDL_AUDIO_S32LE");
+    }else if(ctx->acodec->sample_fmt == AV_SAMPLE_FMT_S16P){
+        audio_spec.format = SDL_AUDIO_S16LE;
+        av_log(NULL, AV_LOG_INFO, "SDL_AUDIO_S16LE");
+    }else if(ctx->acodec->sample_fmt == AV_SAMPLE_FMT_S32P){
+        audio_spec.format = SDL_AUDIO_S32LE;
+        av_log(NULL, AV_LOG_INFO, "SDL_AUDIO_S32LE");
+    }
     #else
     audio_spec.channels = dst_ch_layout.nb_channels;
     audio_spec.freq = ctx.acodec->sample_rate;
@@ -705,26 +807,31 @@ void process_decoded_data(AVFrame *frame, int bytes_per_sample)
     if(!frame->data[0]){
         av_log(NULL, AV_LOG_INFO, "[audio: %ld]: frame.data error \n", audio_frames+1);
     }
-    for(int i = 0; i < frame->nb_samples; i++){
-        for(int j = 0; j < frame->ch_layout.nb_channels; j++){
-            // const char *p = reinterpret_cast<const char *>(frame->data[j] + i * bytes_per_sample);
-            // of.write(p, bytes_per_sample);
-        
-            // #if 0    
-            // s_vaudio.emplace_back(*(p));
-            // s_vaudio.emplace_back(*(p+1));
-            // s_vaudio.emplace_back(*(p+2));
-            // s_vaudio.emplace_back(*(p+3));
-            // #else
-            memcpy(audio_buf + (((i * frame->ch_layout.nb_channels) + j) * bytes_per_sample),
-                frame->data[j] + i * bytes_per_sample,
-                bytes_per_sample);
-            // #endif
-            // pthread_cond_broadcast(&cond);
-            // pthread_cond_wait(&cond, &mutex);
-            // pthread_mutex_unlock(&mutex);
+    if (av_sample_fmt_is_planar((AVSampleFormat)(frame)->format)) {
+        for(int i = 0; i < frame->nb_samples; i++){
+            for(int j = 0; j < frame->ch_layout.nb_channels; j++){
+                // const char *p = reinterpret_cast<const char *>(frame->data[j] + i * bytes_per_sample);
+                // of.write(p, bytes_per_sample);
+            
+                // #if 0    
+                // s_vaudio.emplace_back(*(p));
+                // s_vaudio.emplace_back(*(p+1));
+                // s_vaudio.emplace_back(*(p+2));
+                // s_vaudio.emplace_back(*(p+3));
+                // #else
+                memcpy(audio_buf + (((i * frame->ch_layout.nb_channels) + j) * bytes_per_sample),
+                    frame->data[j] + i * bytes_per_sample,
+                    bytes_per_sample);
+                // #endif
+                // pthread_cond_broadcast(&cond);
+                // pthread_cond_wait(&cond, &mutex);
+                // pthread_mutex_unlock(&mutex);
 
+            }
         }
+    }else
+    {
+        memcpy(audio_buf ,frame->data[0], buffer_size);
     }
     SDL_PutAudioStreamData(audio_stream, audio_buf, buffer_size);
 #else
@@ -947,6 +1054,8 @@ int main(int argc, char *argv[])
         goto __failed;
     }
 
+    SDL_Delay(1000);
+
     // decode
     pkt = av_packet_alloc();
     if(!pkt){
@@ -974,14 +1083,47 @@ int main(int argc, char *argv[])
         av_log(NULL, AV_LOG_ERROR, "pthread_create error!\n");
         return -1;
     }
-    pthread_detach(rpid);
-    pthread_detach(ap_pid);
-    pthread_detach(vpid);
-    pthread_detach(apid);
+
+    // if(pthread_create(&e_pid, NULL, event_process_t, &ctx) < 0){
+    //     av_log(NULL, AV_LOG_ERROR, "pthread_create error!\n");
+    //     return -1;
+    // }
+    // pthread_detach(rpid);
+    // pthread_detach(ap_pid);
+    // pthread_detach(vpid);
+    // pthread_detach(apid);
     
     // SDL 渲染只能在主线程, 而音频推流随意在哪个线程
     int viq_index;
+    SDL_Event event;
     while(running){
+        while(SDL_PollEvent(&event)){
+            switch(event.type){
+                case SDL_EVENT_QUIT:
+                    running = false;
+                    ap_running = false;
+                    ctx.read_pkt_flags = false;
+                    ctx.audio_pkt_decode_flags = false;
+                    ctx.video_pkt_decode_flags = false;
+
+                    break;
+                case SDL_EVENT_KEY_DOWN:
+                    if(event.key.key == SDLK_ESCAPE){
+                        running = false;
+                        ap_running = false;
+                        ctx.read_pkt_flags = false; 
+                        ctx.audio_pkt_decode_flags = false;
+                        ctx.video_pkt_decode_flags = false;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        if(running == false){
+            pthread_cond_signal(&ctx.pkt_queue.video_cond);
+            break;
+        }
         pthread_mutex_lock(&ctx.frame_queue.video_mutex);
         // 当前环形队列为空， 则应该等待生产者生产video_frame 到video_queue
         while(ctx.frame_queue.v_buf_front == ctx.frame_queue.v_buf_rear){
@@ -1063,7 +1205,6 @@ int main(int argc, char *argv[])
 
     }
 
-
 __finished:
     av_log(NULL, AV_LOG_INFO, "video frame is fullly alread processed!\n");
     av_log(NULL, AV_LOG_INFO, "audio_pkts = %ld, video_pkts = %ld\n", audio_pkts, video_pkts);
@@ -1074,25 +1215,11 @@ __finished:
     av_log(NULL, AV_LOG_INFO, "frame_queue_a_rear = %d frame_queue_a_front = %d frame_queue_v_buf_rear = %d frame_queue_v_buf_front = %d\n", 
         ctx.frame_queue.a_buf_rear, ctx.frame_queue.a_buf_front, ctx.frame_queue.v_buf_rear, ctx.frame_queue.v_buf_front);
 
-    SDL_Event event;
-    while(running){
-        while(SDL_PollEvent(&event)){
-            switch(event.type){
-                case SDL_EVENT_QUIT:
-                    running = false;
-                    break;
-                case SDL_EVENT_KEY_DOWN:
-                    if(event.key.key == SDLK_ESCAPE){
-                        running = false;
-                    }
-                    break;
-                default:
-                    break;
-            }
-        }
-
-        // SDL_Log("event.type = %d", event.type);
-    }
+    // pthread_join(e_pid, NULL);
+    pthread_join(rpid, NULL);
+    pthread_join(ap_pid, NULL);
+    pthread_join(vpid, NULL);
+    pthread_join(apid, NULL);
 __failed:
     #ifdef __cplusplus
     #else
